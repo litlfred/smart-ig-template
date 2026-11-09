@@ -621,7 +621,10 @@ class SchemaDocumentationRenderer:
     def _find_injection_point(self, html_content: str, schema_type: str) -> Optional[int]:
         try:
             if schema_type == "logical_model":
+                # The heading's id is the same in every language; its text is
+                # translated on fhir2.base.template (layout-profile.html).
                 patterns = [
+                    r"<h[234][^>]*\bid=[\"']profile[\"'][^>]*>.*?</h[234]>.*?</div>\s*</div>",
                     r"<h3[^>]*>Formal Views of Profile Content</h3>.*?</div>\s*</div>",
                     r"<h2[^>]*>Formal Views of Profile Content</h2>.*?</div>\s*</div>",
                     r"<h3[^>]*>Formal Views</h3>.*?</div>\s*</div>",
@@ -634,7 +637,9 @@ class SchemaDocumentationRenderer:
                         return m.end()
 
             if schema_type == "valueset":
+                # As above: id="expansion" in every language (layout-valueset.html).
                 patterns = [
+                    r"<h[234][^>]*\bid=[\"']expansion[\"'][^>]*>.*?</h[234]>.*?</div>\s*</div>",
                     r"<h3[^>]*>Expansion</h3>.*?</div>\s*</div>",
                     r"<h2[^>]*>Expansion</h2>.*?</div>\s*</div>",
                     r"<h4[^>]*>Expansion</h4>.*?</div>\s*</div>",

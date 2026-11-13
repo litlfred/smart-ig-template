@@ -25,7 +25,7 @@ import sys
 import logging
 import re
 import tempfile
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 
@@ -40,6 +40,74 @@ def setup_logging() -> logging.Logger:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     return logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Language folders
+# ---------------------------------------------------------------------------
+#
+# On fhir2.base.template the IG Publisher writes every page into a language
+# folder (output/en/, output/fr/, ...) and the files at the output root become
+# redirect pages. The generated files (schemas/, *.jsonld, *.openapi.json)
+# stay at the output root. On fhir.base.template there are no language folders
+# and the pages are at the root.
+
+LANGUAGE_DIR_RE = re.compile(r"^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$")
+
+
+def find_language_dirs(output_dir: str) -> List[str]:
+    """Names of the language folders under output_dir, e.g. ["en", "fr"].
+
+    A language folder has a language-code name and its own index.html.
+    """
+    if not os.path.isdir(output_dir):
+        return []
+    langs = []
+    for name in sorted(os.listdir(output_dir)):
+        path = os.path.join(output_dir, name)
+        if LANGUAGE_DIR_RE.match(name) and os.path.isfile(os.path.join(path, "index.html")):
+            langs.append(name)
+    return langs
+
+
+def html_targets(output_dir: str) -> List[Tuple[str, str]]:
+    """Folders whose pages readers see, each with the prefix that reaches the output root.
+
+    With language folders: [(output/en, "../"), (output/fr, "../"), ...].
+    Without: [(output, "")].
+    """
+    langs = find_language_dirs(output_dir)
+    if langs:
+        return [(os.path.join(output_dir, lang), "../") for lang in langs]
+    return [(output_dir, "")]
+
+
+_HREF_RE = re.compile(r'href="([^"]*)"')
+
+
+def prefix_root_links(html: str, prefix: str) -> str:
+    """Point links to generated files at the output root from a language folder.
+
+    Links to pages (*.html) stay as they are, since each language folder has
+    its own copy of every page. Absolute, root-relative, fragment-only and
+    already-prefixed links are left alone.
+    """
+    if not prefix:
+        return html
+
+    def fix(m: "re.Match[str]") -> str:
+        url = m.group(1)
+        path = url.split("#", 1)[0].split("?", 1)[0]
+        if (
+            not path
+            or ":" in path
+            or url.startswith(("/", "#", "../"))
+            or path.endswith((".html", ".htm"))
+        ):
+            return m.group(0)
+        return f'href="{prefix}{url}"'
+
+    return _HREF_RE.sub(fix, html)
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +621,10 @@ class SchemaDocumentationRenderer:
     def _find_injection_point(self, html_content: str, schema_type: str) -> Optional[int]:
         try:
             if schema_type == "logical_model":
+                # The heading's id is the same in every language; its text is
+                # translated on fhir2.base.template (layout-profile.html).
                 patterns = [
+                    r"<h[234][^>]*\bid=[\"']profile[\"'][^>]*>.*?</h[234]>.*?</div>\s*</div>",
                     r"<h3[^>]*>Formal Views of Profile Content</h3>.*?</div>\s*</div>",
                     r"<h2[^>]*>Formal Views of Profile Content</h2>.*?</div>\s*</div>",
                     r"<h3[^>]*>Formal Views</h3>.*?</div>\s*</div>",
@@ -566,7 +637,9 @@ class SchemaDocumentationRenderer:
                         return m.end()
 
             if schema_type == "valueset":
+                # As above: id="expansion" in every language (layout-valueset.html).
                 patterns = [
+                    r"<h[234][^>]*\bid=[\"']expansion[\"'][^>]*>.*?</h[234]>.*?</div>\s*</div>",
                     r"<h3[^>]*>Expansion</h3>.*?</div>\s*</div>",
                     r"<h2[^>]*>Expansion</h2>.*?</div>\s*</div>",
                     r"<h4[^>]*>Expansion</h4>.*?</div>\s*</div>",
@@ -1042,34 +1115,41 @@ class DAKApiHubGenerator:
         enumeration_docs: Optional[List[Dict[str, Any]]] = None,
         jsonld_docs: Optional[List[Dict[str, Any]]] = None,
         existing_openapi_html_content: Optional[str] = None,
-        html_target_dir: Optional[str] = None,
+        targets: Optional[List[Tuple[str, str]]] = None,
     ) -> bool:
+        """Inject the hub into dak-api.html in every target folder.
+
+        targets is a list of (folder, prefix to the output root), from
+        html_targets(). Returns True only if every folder's page was filled.
+        """
         try:
-            target_dir = html_target_dir or output_dir
-            self.logger.info(f"HTML target directory: {target_dir}")
-
-            dak_api_html_path = os.path.join(target_dir, "dak-api.html")
-            if not os.path.exists(dak_api_html_path):
-                self.logger.error(f"dak-api.html not found in {target_dir}")
-                return False
-
-            self.logger.info(f"Found DAK API template at: {dak_api_html_path}")
+            targets = targets or [(output_dir, "")]
             hub_content = self.generate_hub_html_content(
                 schema_docs, openapi_docs, enumeration_docs, jsonld_docs, existing_openapi_html_content
             )
             self.logger.info(f"Generated hub content length: {len(hub_content)} characters")
 
-            html_processor = HTMLProcessor(self.logger, target_dir)
-            self.logger.info("Injecting content into dak-api.html...")
-            ok = html_processor.inject_content_at_comment_marker(dak_api_html_path, hub_content)
+            all_ok = True
+            for target_dir, prefix in targets:
+                self.logger.info(f"HTML target directory: {target_dir} (links to generated files prefixed with '{prefix}')")
+                dak_api_html_path = os.path.join(target_dir, "dak-api.html")
+                if not os.path.exists(dak_api_html_path):
+                    self.logger.error(f"❌ dak-api.html not found in {target_dir}: this folder has no DAK API hub")
+                    all_ok = False
+                    continue
 
-            if ok:
-                self.logger.info(f"✅ Successfully post-processed DAK API hub: {dak_api_html_path}")
-                self.logger.info(f"Final file size: {os.path.getsize(dak_api_html_path)} bytes")
-            else:
-                self.logger.error("❌ Failed to inject content into dak-api.html")
+                html_processor = HTMLProcessor(self.logger, target_dir)
+                ok = html_processor.inject_content_at_comment_marker(
+                    dak_api_html_path, prefix_root_links(hub_content, prefix)
+                )
+                if ok:
+                    self.logger.info(f"✅ Successfully post-processed DAK API hub: {dak_api_html_path}")
+                    self.logger.info(f"Final file size: {os.path.getsize(dak_api_html_path)} bytes")
+                else:
+                    self.logger.error(f"❌ Failed to inject content into {dak_api_html_path}: its DAK API hub stays empty")
+                    all_ok = False
 
-            return ok
+            return all_ok
 
         except Exception as e:
             self.logger.error(f"Error post-processing DAK API hub: {e}")
@@ -1100,13 +1180,16 @@ def main():
         ig_root = Path(output_dir).parent
 
     schema_output_dir = os.path.join(output_dir, "schemas")
-    html_target_dir = output_dir  # post-check phase targets final HTML under output/
+    # The pages readers see: the language folders on fhir2.base.template, the
+    # output root otherwise. Generated files are written at the output root.
+    targets = html_targets(output_dir)
+    html_target_dir = targets[0][0]
 
     logger.info("Post-check phase: targeting output directory for HTML injection")
     logger.info(f"IG root: {ig_root}")
     logger.info(f"Output directory: {output_dir}")
     logger.info(f"Schema output directory: {schema_output_dir}")
-    logger.info(f"HTML target directory: {html_target_dir}")
+    logger.info(f"Page folders: {[t[0] for t in targets]}")
     logger.info(f"OpenAPI directory: {openapi_dir}")
 
     qa_reporter = QAReporter("postprocessing")
@@ -1460,7 +1543,10 @@ def main():
                 # fallback: link just filename (may still work if IG copied it)
                 relative_path = filename
 
-            openapi_html_filename = schema_doc_renderer.inject_into_html(openapi_path, output_dir, f"{clean_name} API Documentation")
+            openapi_html_filename = None
+            for target_dir, _prefix in targets:
+                injected = schema_doc_renderer.inject_into_html(openapi_path, target_dir, f"{clean_name} API Documentation")
+                openapi_html_filename = openapi_html_filename or injected
 
             openapi_docs.append(
                 {
@@ -1502,12 +1588,16 @@ def main():
         enumeration_docs=enumeration_docs,
         jsonld_docs=jsonld_docs,
         existing_openapi_html_content=existing_openapi_html_content,
-        html_target_dir=html_target_dir,
+        targets=targets,
     )
 
     if success:
         logger.info("✅ DAK API documentation generation completed successfully")
     else:
+        qa_reporter.add_error(
+            "DAK API hub was not injected into every page folder",
+            {"page_folders": [t[0] for t in targets]},
+        )
         logger.warning("⚠️ DAK API documentation generation completed with errors - see QA report for details")
 
     # Write merged QA

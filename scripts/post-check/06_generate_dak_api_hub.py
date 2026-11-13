@@ -1183,7 +1183,13 @@ def main():
     # The pages readers see: the language folders on fhir2.base.template, the
     # output root otherwise. Generated files are written at the output root.
     targets = html_targets(output_dir)
-    html_target_dir = targets[0][0]
+    # Read the template from the first folder that has dak-api.html, so a
+    # folder without it (e.g. the first language alphabetically) does not stop
+    # the others from being filled. Folders without it are reported later.
+    html_target_dir = next(
+        (t[0] for t in targets if os.path.exists(os.path.join(t[0], "dak-api.html"))),
+        targets[0][0],
+    )
 
     logger.info("Post-check phase: targeting output directory for HTML injection")
     logger.info(f"IG root: {ig_root}")
